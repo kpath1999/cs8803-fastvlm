@@ -139,3 +139,48 @@ dmypy.json
 
 # FastVLM models
 app/FastVLM/model
+
+# Large data directories and model checkpoints
+data/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Image files (large datasets)
+*.jpg
+*.jpeg
+*.png
+*.tiff
+*.bmp
+# Keep small docs images
+!docs/*.png
+!docs/*.jpg
+
+# Analysis outputs that can be regenerated
+office_loop_analysis/
+full_analysis/
+*_analysis/
+video_analysis_output/
+visualizations/
+
+# Numpy arrays and pickle files
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# MLX model files
+*.mlx
+
+# Temporary files
+*.tmp
+*.temp
