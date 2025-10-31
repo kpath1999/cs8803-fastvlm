@@ -1,5 +1,11 @@
-### FastVLM Video Analysis for Multi-Temporal Route Comparison
+# FastVLM Video Analysis for Multi-Temporal Route Comparison
+
+More details can be found here: [link](https://docs.google.com/document/d/1B7olGH20mLg_vbxM9kXPgtVxORdQn5aJza6HhdTuOmo/edit?usp=sharing)
 
 This project leverages FastVLM (Fast Vision-Language Model) to analyze video sequences of the same route captured under different seasonal and environmental conditions. The primary objective is to develop semantic understanding capabilities that can identify persistent landmarks and route structures while being robust to temporal variations such as weather changes, lighting conditions, and seasonal foliage differences.
 
 The system extracts semantic descriptions and visual embeddings from video frames to compute similarity matrices between route traversals, identify condition-invariant landmarks, and perform cross-temporal matching. This approach serves as a foundation for semantic SLAM (Simultaneous Localization and Mapping) applications where autonomous agents must recognize and navigate familiar routes despite significant environmental changes over time. The analysis pipeline demonstrates how vision-language models can bridge the gap between low-level visual features and high-level semantic understanding necessary for robust place recognition in dynamic outdoor environments.
+
+Datasets:
+* [FourSeasons](https://cvg.cit.tum.de/data/datasets/4seasons-dataset/download)
+* [ROVER](https://iis-esslingen.github.io/rover/pages/dataset_overview/)
