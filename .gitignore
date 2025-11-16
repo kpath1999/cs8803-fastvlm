@@ -171,6 +171,10 @@ full_analysis/
 *_analysis/
 video_analysis_output/
 visualizations/
+pipeline_results/
+artifacts/
+archive/
+annotations/
 
 # Numpy arrays and pickle files
 *.npy
