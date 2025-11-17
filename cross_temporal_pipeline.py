@@ -51,6 +51,7 @@ Stage 7: SEMANTIC SEGMENTATION (STRETCH GOAL)
 
 USAGE:
 ======
+# Recommended: Fast keyframe selection with focused object detection
 python cross_temporal_pipeline.py \
     --winter-rgb /Volumes/KAUSAR/rover_dataset/2024-01-13/realsense_D435i/rgb \
     --winter-depth /Volumes/KAUSAR/rover_dataset/2024-01-13/realsense_D435i/depth \
@@ -58,9 +59,26 @@ python cross_temporal_pipeline.py \
     --autumn-depth /Volumes/KAUSAR/rover_dataset/2024-04-11/realsense_D435i/depth \
     --model-path checkpoints/llava-fastvithd_0.5b_stage2 \
     --output-dir pipeline_results \
+    --use-keyframing \
     --adaptive-thresholds \
     --focused-queries \
+    --max-pairs 100
+
+# Basic: Process all frames without keyframe selection
+python cross_temporal_pipeline.py \
+    --winter-rgb /path/to/winter/rgb \
+    --winter-depth /path/to/winter/depth \
+    --autumn-rgb /path/to/autumn/rgb \
+    --autumn-depth /path/to/autumn/depth \
+    --model-path checkpoints/llava-fastvithd_0.5b_stage2 \
+    --output-dir pipeline_results \
     --max-pairs 10
+
+KEY OPTIONS:
+  --use-keyframing         Enable fast histogram-based keyframe selection (highly recommended for large datasets)
+  --adaptive-thresholds    Use per-category detection thresholds for better accuracy
+  --focused-queries        Use only permanent landmark queries (house, tree, etc.)
+  --max-pairs N            Process at most N frame pairs (useful for testing)
 """
 
 from __future__ import annotations
@@ -78,7 +96,6 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from scipy.spatial.distance import cosine
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 from transformers import OwlViTForObjectDetection, OwlViTProcessor
@@ -497,7 +514,8 @@ class FastVLMAnalyzer:
             vision_tower = self.model.get_vision_tower()
             vision_feats = vision_tower(image_tensor.unsqueeze(0).to(self.device, dtype=torch.float16))
             # Average pool spatial dimensions to get single vector
-            embedding = vision_feats.mean(dim=(1, 2)).squeeze().cpu().numpy()
+            # Don't squeeze - just take the first element of batch dimension
+            embedding = vision_feats.mean(dim=(1, 2))[0].cpu().numpy()
         return embedding
     
     def compare_objects(self, desc1: str, desc2: str) -> Tuple[float, str]:
@@ -735,7 +753,12 @@ class KeypointMatcher:
         kp1, des1 = self.detector.detectAndCompute(crop1, None)
         kp2, des2 = self.detector.detectAndCompute(crop2, None)
         
+        # DEBUG
+        print(f"      DEBUG [Keypoints]: Crop1 size: {crop1.shape}, Crop2 size: {crop2.shape}")
+        print(f"      DEBUG [Keypoints]: KP1: {len(kp1) if kp1 else 0}, KP2: {len(kp2) if kp2 else 0}")
+        
         if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+            print(f"      DEBUG [Keypoints]: Insufficient keypoints or descriptors")
             return 0, 0.0
         
         # Match descriptors
@@ -754,7 +777,10 @@ class KeypointMatcher:
                 if m.distance < ratio_threshold * n.distance:
                     good_matches.append(m)
         
+        print(f"      DEBUG [Keypoints]: Total matches: {len(matches)}, Good matches: {len(good_matches)}")
+        
         if len(good_matches) < 4:
+            print(f"      DEBUG [Keypoints]: Insufficient good matches (< 4)")
             return 0, 0.0
         
         # Extract matched keypoint locations
@@ -801,64 +827,173 @@ class CrossTemporalPipeline:
         queries: Optional[List[str]] = None,
         use_adaptive_thresholds: bool = False,
         use_focused_queries: bool = False,
+        use_keyframing: bool = False,
+        keyframe_similarity_threshold: float = 0.95,
     ):
         """
         Initialize pipeline components.
         
         Args:
-            winter_rgb_dir: Directory with winter RGB images
-            winter_depth_dir: Directory with winter depth images
-            autumn_rgb_dir: Directory with autumn RGB images
-            autumn_depth_dir: Directory with autumn depth images
+            winter_rgb_dir: Path to winter RGB images
+            winter_depth_dir: Path to winter depth images
+            autumn_rgb_dir: Path to autumn RGB images
+            autumn_depth_dir: Path to autumn depth images
             model_path: Path to FastVLM checkpoint
-            output_dir: Output directory for results
-            device: Device for inference
-            detection_threshold: Minimum confidence for detections (ignored if use_adaptive_thresholds=True)
+            output_dir: Directory for results
+            device: Inference device
+            detection_threshold: Default score threshold for OWL-ViT
             queries: Object categories to detect
             use_adaptive_thresholds: Use per-category thresholds based on empirical analysis
             use_focused_queries: Use only high-confidence queries (ignores queries argument)
+            use_keyframing: Enable keyframe selection to reduce the number of images
+            keyframe_similarity_threshold: Histogram correlation threshold for keyframe selection
         """
         self.winter_rgb_dir = winter_rgb_dir
         self.winter_depth_dir = winter_depth_dir
         self.autumn_rgb_dir = autumn_rgb_dir
         self.autumn_depth_dir = autumn_depth_dir
         self.output_dir = output_dir
+        self.use_keyframing = use_keyframing
+        self.keyframe_similarity_threshold = keyframe_similarity_threshold
         
         # Create output directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "visualizations").mkdir(exist_ok=True)
         (self.output_dir / "data").mkdir(exist_ok=True)
-        (self.output_dir / "crops").mkdir(exist_ok=True)
+
+        # Initialize models
+        print("\n" + "="*70)
+        print("INITIALIZING MODELS")
+        print("="*70)
         
-        # Initialize components
-        print("Initializing FastVLM...")
+        print("Loading FastVLM for semantic analysis...")
         self.vlm = FastVLMAnalyzer(model_path, device=device)
         
-        print("Initializing OWL-ViT detector...")
+        print("Loading OWL-ViT for object detection...")
         self.detector = OpenVocabularyDetector(
-            device=device,
+            device=device, 
             score_threshold=detection_threshold,
             use_adaptive_thresholds=use_adaptive_thresholds
         )
         
+        print("Loading Keypoint Matcher...")
+        self.keypoint_matcher = KeypointMatcher()
+        
+        print("Initializing Depth Validator...")
         self.depth_validator = DepthValidator()
-        self.keypoint_matcher = KeypointMatcher(method="orb")
         
-        # Determine query set
+        self.queries = queries or DEFAULT_QUERIES
         if use_focused_queries:
-            try:
-                from adaptive_threshold_config import RECOMMENDED_GARDEN_QUERIES  # or ULTRA_FAST_QUERIES
-                self.queries = RECOMMENDED_GARDEN_QUERIES
-                print(f"Using focused query set: {len(self.queries)} high-confidence categories")
-            except ImportError:
-                print("WARNING: adaptive_threshold_config not found, using default queries")
-                self.queries = queries or DEFAULT_QUERIES
-        else:
-            self.queries = queries or DEFAULT_QUERIES
+            self.queries = list(PERMANENT_CATEGORIES)
+            print(f"Using focused queries: {self.queries}")
         
-        print(f"Pipeline initialized with {len(self.queries)} query terms")
+        print("\n" + "="*70)
+        print("PIPELINE READY")
+        print("="*70)
         if use_adaptive_thresholds:
             print("Using adaptive per-category thresholds")
+        if self.use_keyframing:
+            print(f"Using keyframe selection with similarity threshold: {self.keyframe_similarity_threshold}")
+
+    def _compute_color_histogram(self, image_path: Path) -> Optional[np.ndarray]:
+        """
+        Compute a color histogram for fast frame comparison.
+        
+        Uses HSV color space with 8 bins per channel for a compact 
+        512-dimensional feature vector (8x8x8). This is much faster
+        than deep learning embeddings.
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            Normalized histogram or None if loading fails
+        """
+        try:
+            # Load image efficiently
+            image = cv2.imread(str(image_path))
+            if image is None:
+                return None
+            
+            # Convert to HSV color space (more perceptually uniform than RGB)
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            
+            # Compute 3D histogram: 8 bins per channel
+            hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], 
+                               [0, 180, 0, 256, 0, 256])
+            
+            # Normalize to make it scale-invariant
+            hist = cv2.normalize(hist, hist).flatten()
+            
+            return hist
+        except Exception as e:
+            print(f"Warning: Could not process {image_path}, skipping. Error: {e}")
+            return None
+
+    def _select_keyframes(
+        self,
+        image_paths: List[Path],
+        similarity_threshold: float,
+        dataset_name: str
+    ) -> List[Path]:
+        """
+        STAGE 0: Select keyframes using fast histogram-based comparison.
+        
+        Uses color histograms instead of deep learning embeddings for
+        significantly faster processing (~100x speedup). A new keyframe 
+        is selected when the histogram difference exceeds the threshold.
+        
+        Args:
+            image_paths: Chronologically sorted list of image paths.
+            similarity_threshold: Histogram correlation threshold [0, 1]. 
+                                  A new keyframe is chosen if correlation is *below* this value.
+                                  Typical values: 0.90-0.98 (higher = more keyframes)
+            dataset_name: Name of the dataset for logging (e.g., "Winter").
+            
+        Returns:
+            A reduced list of image paths representing keyframes.
+        """
+        if not image_paths:
+            return []
+
+        print(f"\n" + "-"*30)
+        print(f"STAGE 0: Selecting keyframes for {dataset_name} dataset")
+        print(f"  Total images to process: {len(image_paths)}")
+        print(f"  Similarity threshold: < {similarity_threshold} (histogram correlation)")
+        print(f"  Using fast color histogram approach (no neural network)")
+        print("-" * 30)
+
+        keyframes = []
+        last_keyframe_hist = None
+
+        for image_path in tqdm(image_paths, desc=f"Selecting {dataset_name} keyframes"):
+            current_hist = self._compute_color_histogram(image_path)
+            if current_hist is None:
+                continue
+
+            # The first image is always a keyframe
+            if last_keyframe_hist is None:
+                keyframes.append(image_path)
+                last_keyframe_hist = current_hist
+                continue
+
+            # Compare histograms using correlation
+            # cv2.HISTCMP_CORREL returns values in [0, 1] where 1 = identical
+            correlation = cv2.compareHist(
+                last_keyframe_hist.astype(np.float32), 
+                current_hist.astype(np.float32), 
+                cv2.HISTCMP_CORREL
+            )
+
+            # Select as keyframe if correlation is below threshold
+            # (i.e., images are sufficiently different)
+            if correlation < similarity_threshold:
+                keyframes.append(image_path)
+                last_keyframe_hist = current_hist
+        
+        print(f"  → Selected {len(keyframes)} keyframes from {len(image_paths)} total images")
+        print(f"  → Reduction: {len(image_paths)} → {len(keyframes)} ({100 * len(keyframes) / len(image_paths):.1f}%)")
+        return keyframes
     
     def find_frame_pairs(
         self, 
@@ -907,8 +1042,13 @@ class CrossTemporalPipeline:
             if not p.name.startswith("._")
         ])
         
+        # STAGE 0: Optional Keyframe Selection
+        if self.use_keyframing:
+            winter_images = self._select_keyframes(winter_images, self.keyframe_similarity_threshold, "Winter")
+            autumn_images = self._select_keyframes(autumn_images, self.keyframe_similarity_threshold, "Autumn")
+
         # DEBUG: Show what files were found
-        print(f"DEBUG: Found {len(winter_images)} winter images")
+        print(f"DEBUG: Found {len(winter_images)} winter images to be used for matching.")
         if len(winter_images) > 0:
             print(f"DEBUG: First 3 winter images: {[str(p.name) for p in winter_images[:3]]}")
         else:
@@ -1002,6 +1142,13 @@ class CrossTemporalPipeline:
             # Stage 3: Semantic enrichment with FastVLM
             description = self.vlm.describe_object(crop)
             embedding = self.vlm.get_vision_embedding(crop)
+            
+            # DEBUG: Check embedding shape
+            print(f"    DEBUG: Embedding shape: {embedding.shape}, dtype: {embedding.dtype}, ndim: {embedding.ndim}")
+            if embedding.ndim > 0:
+                print(f"    DEBUG: Embedding first 5 values: {embedding[:5]}")
+            else:
+                print(f"    DEBUG: Embedding is scalar: {embedding}")
             
             # Stage 4: Extract depth statistics if available
             depth_stats = None
@@ -1313,26 +1460,18 @@ class CrossTemporalPipeline:
             raise
         
         # Find corresponding depth images
+        # Note: RGB and depth may have slightly different timestamps
+        # Find the closest matching depth file by timestamp
         winter_stem = Path(winter_path).stem
         autumn_stem = Path(autumn_path).stem
         
-        winter_depth_path = None
-        autumn_depth_path = None
-        
-        for ext in ['.png', '.jpg', '.tiff']:
-            candidate = self.winter_depth_dir / f"{winter_stem}{ext}"
-            if candidate.exists():
-                winter_depth_path = str(candidate)
-                break
-        
-        for ext in ['.png', '.jpg', '.tiff']:
-            candidate = self.autumn_depth_dir / f"{autumn_stem}{ext}"
-            if candidate.exists():
-                autumn_depth_path = str(candidate)
-                break
+        winter_depth_path = self._find_closest_depth_file(self.winter_depth_dir, winter_stem)
+        autumn_depth_path = self._find_closest_depth_file(self.autumn_depth_dir, autumn_stem)
         
         # DEBUG: Depth paths
+        print(f"  DEBUG: Winter RGB stem: {winter_stem}")
         print(f"  DEBUG: Winter depth path: {winter_depth_path}")
+        print(f"  DEBUG: Autumn RGB stem: {autumn_stem}")
         print(f"  DEBUG: Autumn depth path: {autumn_depth_path}")
         
         # Detect landmarks in both frames
@@ -1473,6 +1612,58 @@ class CrossTemporalPipeline:
         x2 = min(width - 1, x2 + pad_w)
         y2 = min(height - 1, y2 + pad_h)
         return [x1, y1, x2, y2]
+    
+    def _find_closest_depth_file(self, depth_dir: Path, rgb_stem: str) -> Optional[str]:
+        """
+        Find the depth file with the closest matching timestamp to an RGB file.
+        
+        RGB and depth files may have slightly different timestamps due to
+        sensor synchronization. This finds the depth file with the closest
+        timestamp within a reasonable tolerance (100ms).
+        
+        Args:
+            depth_dir: Directory containing depth images
+            rgb_stem: Stem of RGB filename (e.g., "1705136563.3253479")
+            
+        Returns:
+            Path to closest depth file, or None if not found
+        """
+        try:
+            # Parse the RGB timestamp
+            rgb_timestamp = float(rgb_stem)
+        except ValueError:
+            return None
+        
+        # Find all depth files
+        depth_files = []
+        for ext in ['.png', '.jpg', '.tiff']:
+            depth_files.extend(depth_dir.glob(f"*{ext}"))
+        
+        # Filter out macOS resource fork files
+        depth_files = [f for f in depth_files if not f.name.startswith("._")]
+        
+        if not depth_files:
+            return None
+        
+        # Find closest timestamp
+        best_match = None
+        best_diff = float('inf')
+        
+        for depth_file in depth_files:
+            try:
+                depth_timestamp = float(depth_file.stem)
+                diff = abs(depth_timestamp - rgb_timestamp)
+                
+                # Only consider files within 100ms (0.1 seconds)
+                if diff < 0.1 and diff < best_diff:
+                    best_diff = diff
+                    best_match = depth_file
+            except ValueError:
+                continue
+        
+        if best_match:
+            return str(best_match)
+        return None
 
 
 # ===========================================================================
@@ -1621,15 +1812,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use only high-confidence queries (house, tree, window, etc.) instead of full query set"
     )
+    parser.add_argument(
+        "--use-keyframing",
+        action="store_true",
+        help="Enable fast histogram-based keyframe selection (recommended for large datasets)"
+    )
     
     return parser.parse_args()
 
 
 def main():
-    """Main entry point."""
+    """Main entry point for the pipeline."""
     args = parse_args()
     
-    # Initialize pipeline
     pipeline = CrossTemporalPipeline(
         winter_rgb_dir=Path(args.winter_rgb),
         winter_depth_dir=Path(args.winter_depth),
@@ -1640,7 +1835,8 @@ def main():
         device=args.device,
         detection_threshold=args.detection_threshold,
         use_adaptive_thresholds=args.adaptive_thresholds,
-        use_focused_queries=args.focused_queries
+        use_focused_queries=args.focused_queries,
+        use_keyframing=args.use_keyframing,
     )
     
     # Run pipeline
