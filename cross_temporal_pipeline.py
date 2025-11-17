@@ -58,7 +58,8 @@ python cross_temporal_pipeline.py \
     --autumn-depth /Volumes/KAUSAR/rover_dataset/2024-04-11/realsense_D435i/depth \
     --model-path checkpoints/llava-fastvithd_0.5b_stage2 \
     --output-dir pipeline_results \
-    --detection-threshold 0.2 \
+    --adaptive-thresholds \
+    --focused-queries \
     --max-pairs 10
 """
 
@@ -245,6 +246,7 @@ class OpenVocabularyDetector:
         model_name: str = "google/owlvit-base-patch32",
         device: str = "cpu",
         score_threshold: float = 0.2,
+        use_adaptive_thresholds: bool = False,
     ):
         """
         Initialize the detector.
@@ -253,12 +255,25 @@ class OpenVocabularyDetector:
             model_name: Hugging Face model identifier
             device: Device to run inference on (cpu/cuda/mps)
             score_threshold: Minimum confidence for detections (0.2 is good for garden scenes)
+            use_adaptive_thresholds: If True, use per-category thresholds instead of global
         """
         self.processor = OwlViTProcessor.from_pretrained(model_name)
         self.model = OwlViTForObjectDetection.from_pretrained(model_name)
         self.device = torch.device(device)
         self.model.to(self.device)
         self.score_threshold = score_threshold
+        self.use_adaptive_thresholds = use_adaptive_thresholds
+        
+        print(f"      OWL-ViT loaded on device: {self.device}")
+        
+        if use_adaptive_thresholds:
+            try:
+                from adaptive_threshold_config import get_threshold
+                self.get_threshold = get_threshold
+                print("      Using adaptive per-category thresholds")
+            except ImportError:
+                print("      WARNING: adaptive_threshold_config not found, using global threshold")
+                self.use_adaptive_thresholds = False
 
     def detect(
         self, 
@@ -286,7 +301,7 @@ class OpenVocabularyDetector:
 
         # Convert to image coordinates
         target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
-        results = self.processor.post_process_object_detection(
+        results = self.processor.post_process_grounded_object_detection(
             outputs=outputs, 
             target_sizes=target_sizes, 
             threshold=0.0
@@ -294,31 +309,90 @@ class OpenVocabularyDetector:
 
         detections = []
         all_scores = []
+        all_detections_with_labels = []  # Store ALL detections with labels for analysis
+        
         for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
             score_value = score.item()
+            label_text = queries[label.item()]
+            bbox = box.tolist()
+            
             all_scores.append(score_value)
-            if score_value < self.score_threshold:
+            all_detections_with_labels.append({
+                "label": label_text,
+                "score": score_value,
+                "bbox": bbox,
+            })
+            
+            # Determine threshold for this category
+            if self.use_adaptive_thresholds:
+                category_threshold = self.get_threshold(label_text)
+            else:
+                category_threshold = self.score_threshold
+            
+            if score_value < category_threshold:
                 continue
-            bbox = box.tolist()  # [x1, y1, x2, y2]
+                
             detections.append({
-                "label": queries[label.item()],
+                "label": label_text,
                 "score": score_value,
                 "bbox": bbox,
             })
         
-        # DEBUG
+        # DEBUG - Show top 10 detections with labels to see what's being detected
         print(f"      DEBUG [OWL-ViT]: Found {len(detections)} detections above threshold {self.score_threshold}")
         if len(all_scores) > 0:
             print(f"      DEBUG [OWL-ViT]: Score range: {min(all_scores):.3f} - {max(all_scores):.3f}")
-            # Show top 5 scores even if below threshold
-            top_5_scores = sorted(all_scores, reverse=True)[:5]
-            print(f"      DEBUG [OWL-ViT]: Top 5 scores: {[f'{s:.3f}' for s in top_5_scores]}")
+            
+            # Show top 10 detections WITH LABELS to see what's being detected
+            top_10 = sorted(all_detections_with_labels, key=lambda x: x["score"], reverse=True)[:10]
+            print(f"      DEBUG [OWL-ViT]: Top 10 detections (label: score):")
+            for i, det in enumerate(top_10, 1):
+                status = "✓" if det["score"] >= self.score_threshold else "✗"
+                print(f"        {i}. {status} {det['label']}: {det['score']:.3f}")
+        
+        # Apply per-category NMS: keep only highest-scoring detection per category
+        detections = self._apply_per_category_nms(detections)
+        print(f"      DEBUG [OWL-ViT]: After per-category NMS: {len(detections)} unique detections")
+        
         if len(detections) > 0:
-            print(f"      DEBUG [OWL-ViT]: Top detection: {detections[0]['label']} ({detections[0]['score']:.3f})")
+            print(f"      DEBUG [OWL-ViT]: ✓ {len(detections)} unique detections")
+            # Show which categories were kept
+            kept_categories = [f"{d['label']}({d['score']:.3f})" for d in sorted(detections, key=lambda x: x['score'], reverse=True)]
+            print(f"      DEBUG [OWL-ViT]: Kept: {', '.join(kept_categories)}")
         else:
-            print(f"      DEBUG [OWL-ViT]: ⚠️  No detections above threshold! Try lowering --detection-threshold")
+            print(f"      DEBUG [OWL-ViT]: ⚠️  No detections above threshold {self.score_threshold}!")
+            if len(all_detections_with_labels) > 0:
+                best = all_detections_with_labels[0]
+                print(f"      DEBUG [OWL-ViT]: Best detection was '{best['label']}' at {best['score']:.3f}")
+                print(f"      DEBUG [OWL-ViT]: Consider lowering threshold to {best['score'] - 0.01:.2f}")
         
         return detections
+    
+    def _apply_per_category_nms(self, detections: List[Dict]) -> List[Dict]:
+        """
+        Keep only the highest-scoring detection per category.
+        
+        This eliminates duplicate detections of the same object type,
+        significantly reducing the number of detections to process.
+        
+        Args:
+            detections: List of detections with label, score, bbox
+            
+        Returns:
+            Filtered list with one detection per category
+        """
+        if len(detections) == 0:
+            return []
+        
+        # Group by category
+        category_detections = {}
+        for det in detections:
+            label = det["label"]
+            if label not in category_detections or det["score"] > category_detections[label]["score"]:
+                category_detections[label] = det
+        
+        # Return only the best detection per category
+        return list(category_detections.values())
 
 
 # ===========================================================================
@@ -724,7 +798,9 @@ class CrossTemporalPipeline:
         output_dir: Path,
         device: str = "mps",
         detection_threshold: float = 0.2,
-        queries: Optional[List[str]] = None
+        queries: Optional[List[str]] = None,
+        use_adaptive_thresholds: bool = False,
+        use_focused_queries: bool = False,
     ):
         """
         Initialize pipeline components.
@@ -737,8 +813,10 @@ class CrossTemporalPipeline:
             model_path: Path to FastVLM checkpoint
             output_dir: Output directory for results
             device: Device for inference
-            detection_threshold: Minimum confidence for detections (0.2 recommended)
+            detection_threshold: Minimum confidence for detections (ignored if use_adaptive_thresholds=True)
             queries: Object categories to detect
+            use_adaptive_thresholds: Use per-category thresholds based on empirical analysis
+            use_focused_queries: Use only high-confidence queries (ignores queries argument)
         """
         self.winter_rgb_dir = winter_rgb_dir
         self.winter_depth_dir = winter_depth_dir
@@ -759,16 +837,28 @@ class CrossTemporalPipeline:
         print("Initializing OWL-ViT detector...")
         self.detector = OpenVocabularyDetector(
             device=device,
-            score_threshold=detection_threshold
+            score_threshold=detection_threshold,
+            use_adaptive_thresholds=use_adaptive_thresholds
         )
         
         self.depth_validator = DepthValidator()
         self.keypoint_matcher = KeypointMatcher(method="orb")
         
-        # Default queries if not provided
-        self.queries = queries or DEFAULT_QUERIES
+        # Determine query set
+        if use_focused_queries:
+            try:
+                from adaptive_threshold_config import RECOMMENDED_GARDEN_QUERIES  # or ULTRA_FAST_QUERIES
+                self.queries = RECOMMENDED_GARDEN_QUERIES
+                print(f"Using focused query set: {len(self.queries)} high-confidence categories")
+            except ImportError:
+                print("WARNING: adaptive_threshold_config not found, using default queries")
+                self.queries = queries or DEFAULT_QUERIES
+        else:
+            self.queries = queries or DEFAULT_QUERIES
         
         print(f"Pipeline initialized with {len(self.queries)} query terms")
+        if use_adaptive_thresholds:
+            print("Using adaptive per-category thresholds")
     
     def find_frame_pairs(
         self, 
@@ -958,10 +1048,17 @@ class CrossTemporalPipeline:
             return [], winter_dets, autumn_dets
         
         # Compute pairwise embedding similarities
-        winter_embeddings = np.array([d.embedding for d in winter_dets])
-        autumn_embeddings = np.array([d.embedding for d in autumn_dets])
+        # Stack embeddings properly: each embedding should be a row
+        winter_embeddings = np.vstack([d.embedding.reshape(1, -1) if d.embedding.ndim == 1 
+                                       else d.embedding for d in winter_dets])
+        autumn_embeddings = np.vstack([d.embedding.reshape(1, -1) if d.embedding.ndim == 1 
+                                       else d.embedding for d in autumn_dets])
         
-        # Cosine similarity matrix
+        # DEBUG: Check embedding shapes
+        print(f"  DEBUG: Winter embeddings shape: {winter_embeddings.shape}")
+        print(f"  DEBUG: Autumn embeddings shape: {autumn_embeddings.shape}")
+        
+        # Cosine similarity matrix (n_winter x n_autumn)
         sim_matrix = cosine_similarity(winter_embeddings, autumn_embeddings)
         
         # Greedy matching: match each winter detection to best autumn detection
@@ -1401,17 +1498,28 @@ DEFAULT_QUERIES = [
     "wall",
     "planter",
     "pot",
-    # Vegetation (temporal - changes with seasons)
+    # Vegetation (temporal - changes with seasons) - MORE SPECIFIC
     "bush",
     "shrub",
     "flowers",
     "grass",
     "hedge",
     "plant",
+    "leaves",
+    "branch",
+    "foliage",
+    # Small seasonal elements
+    "snow",
+    "ice",
+    "puddle",
+    "mud",
     # Buildings/structures
     "house",
     "building",
     "shed",
+    "window",
+    "door",
+    "roof",
 ]
 
 # Categories that are typically permanent/invariant
@@ -1496,12 +1604,22 @@ def parse_args() -> argparse.Namespace:
         "--detection-threshold",
         type=float,
         default=0.2,
-        help="Minimum confidence for object detections (0.2 recommended for garden scenes)"
+        help="Minimum confidence for object detections (ignored if --adaptive-thresholds is used)"
     )
     parser.add_argument(
         "--max-pairs",
         type=int,
         help="Maximum number of frame pairs to process"
+    )
+    parser.add_argument(
+        "--adaptive-thresholds",
+        action="store_true",
+        help="Use per-category thresholds based on empirical analysis (recommended for garden scenes)"
+    )
+    parser.add_argument(
+        "--focused-queries",
+        action="store_true",
+        help="Use only high-confidence queries (house, tree, window, etc.) instead of full query set"
     )
     
     return parser.parse_args()
@@ -1520,7 +1638,9 @@ def main():
         model_path=args.model_path,
         output_dir=Path(args.output_dir),
         device=args.device,
-        detection_threshold=args.detection_threshold
+        detection_threshold=args.detection_threshold,
+        use_adaptive_thresholds=args.adaptive_thresholds,
+        use_focused_queries=args.focused_queries
     )
     
     # Run pipeline
