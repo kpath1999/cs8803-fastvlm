@@ -175,6 +175,7 @@ pipeline_results/
 artifacts/
 archive/
 annotations/
+geometric_results_keyframed/
 
 # Numpy arrays and pickle files
 *.npy
