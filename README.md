@@ -155,25 +155,39 @@ See `pyproject.toml` for full dependencies.
 
 ## Evaluation Framework
 
-To rigorously assess the pipeline's effectiveness, we propose a controlled comparison against two baseline methods. This evaluation isolates the contribution of multi-modal fusion by using identical detection inputs across all methods.
+To rigorously assess the pipeline's effectiveness, we've implemented a controlled comparison against two baseline methods in the `experiments/` directory. This evaluation isolates the contribution of multi-modal fusion by using identical detection inputs across all methods.
+
+### Quick Start - Run Experiments
+
+```bash
+# Run all experiments (detection → baselines → full pipeline → evaluation)
+bash experiments/run_all_experiments.sh
+
+# Or run individual stages (see experiments/README.md for details)
+```
+
+See **[experiments/README.md](experiments/README.md)** for complete documentation.
 
 ### Experimental Design
 
-**Controlled Detection (Stages 1-2):**
+**Controlled Detection (Stage 1):**
 All methods use identical OWL-ViT detections with the same queries and confidence threshold. This ensures fair comparison by providing the same candidate bounding boxes to each approach.
 
 Implementation:
-1. Run detection once and save raw outputs (bounding boxes, labels, scores) to `detections.json`
+1. Run `experiments/generate_detections.py` once to save raw outputs (bounding boxes, labels, scores)
 2. Load these identical detections for all three methods during matching
 
-**Differentiated Matching (Stages 3-5):**
+**Differentiated Matching (Stages 2-4):**
 After obtaining identical bounding boxes, each method applies different matching strategies:
 
-| Method | Matching Approach | Stages Used |
-|--------|------------------|-------------|
-| **Baseline A** (Embedding-only) | FastVLM visual embeddings + cosine similarity | Stage 3 only |
-| **Baseline B** (Geometric-only) | ORB/SIFT keypoint matching within bounding boxes | Stage 5 only |
-| **Full Pipeline** (Ours) | Multi-modal fusion: embedding + semantic + depth + geometric | Stages 3-5 |
+| Method | Matching Approach | Stages Used | Script |
+|--------|------------------|-------------|--------|
+| **Baseline A** (Embedding-only) | FastVLM visual embeddings + cosine similarity | Stage 3 only | `baseline_a_embedding.py` |
+| **Baseline B** (Geometric-only) | ORB/SIFT keypoint matching within bounding boxes | Stage 5 only | `baseline_b_geometric.py` |
+| **Full Pipeline** (Ours) | Multi-modal fusion: embedding + semantic + depth + geometric | Stages 3-5 | `full_pipeline_comparison.py` |
+
+**Evaluation (Stage 5):**
+Run `experiments/evaluate_methods.py` to generate comprehensive metrics for all research questions.
 
 ### Research Questions
 

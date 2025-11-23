@@ -500,23 +500,36 @@ class FastVLMAnalyzer:
         return self._generate(image, prompt, temperature=0.2)
 
     def get_vision_embedding(self, image: Image.Image) -> np.ndarray:
-        """
-        Extract visual feature embedding from image.
         
-        This embedding captures high-level visual semantics and can be used
-        for similarity comparison across frames.
-        
-        Returns:
-            Numpy array of shape (embedding_dim,)
-        """
         image_tensor = process_images([image], self.image_processor, self.model.config)[0]
+
         with torch.no_grad():
             vision_tower = self.model.get_vision_tower()
-            vision_feats = vision_tower(image_tensor.unsqueeze(0).to(self.device, dtype=torch.float16))
-            # Average pool spatial dimensions to get single vector
-            # Don't squeeze - just take the first element of batch dimension
-            embedding = vision_feats.mean(dim=(1, 2))[0].cpu().numpy()
-        return embedding
+            vision_feats = vision_tower(
+                image_tensor.unsqueeze(0).to(self.device, dtype=torch.float16)
+            )
+
+            # Some FastVLM implementations return dicts
+            if isinstance(vision_feats, dict):
+                vision_feats = vision_feats.get("image_features", vision_feats["feats"])
+
+            # Case 1: (B, C, H, W)
+            if vision_feats.ndim == 4:
+                B, C, H, W = vision_feats.shape
+                vision_feats = vision_feats.permute(0, 2, 3, 1).reshape(B, H * W, C)
+
+            # Case 2: (B, S, D)
+            if vision_feats.ndim == 3:
+                embedding = vision_feats.mean(dim=1)[0].cpu().numpy().astype(np.float32)
+                return embedding
+
+            # Case 3: (B, D)
+            if vision_feats.ndim == 2:
+                return vision_feats[0].cpu().numpy().astype(np.float32)
+
+            # Anything else is unexpected
+            raise ValueError(f"Unexpected vision_feats shape: {vision_feats.shape}")
+
     
     def compare_objects(self, desc1: str, desc2: str) -> Tuple[float, str]:
         """
