@@ -170,8 +170,8 @@ office_loop_analysis/
 full_analysis/
 *_analysis/
 video_analysis_output/
-visualizations/
 pipeline_results/
+visualizations/
 artifacts/
 archive/
 annotations/
