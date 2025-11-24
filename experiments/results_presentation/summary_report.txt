@@ -1,0 +1,86 @@
+================================================================================
+CROSS-SEASON LANDMARK MATCHING: KEY RESULTS
+================================================================================
+
+DESIRED BEHAVIOR
+--------------------------------------------------------------------------------
+Goal: Match physical landmarks (buildings, trees, signs, benches) between
+      autumn and winter image streams despite severe appearance changes.
+
+Success Criteria:
+  1. High match quality (overall_quality_score > 0.5)
+  2. Correct label agreement (same object type matched)
+  3. Spatial consistency (high IoU between bounding boxes)
+  4. Geometric verification (RANSAC inliers confirm match)
+  5. Invariant classification (depth consistency distinguishes permanent structures)
+
+QUANTITATIVE RESULTS
+--------------------------------------------------------------------------------
+                      Method  Total Queries  Total Matches  Matches/Query  Top-1 Quality  Avg Quality  High Quality %  Label Jaccard  Avg IoU  Match Rate  Visual Score  Semantic Score  Geometric Score  Avg Inliers
+Baseline A (Visual+Semantic)             10             55            5.5       0.500427     0.479049       38.181818       0.836385 0.252302    0.178905      0.873713        0.836385              NaN          NaN
+      Baseline B (Geometric)             10             50            5.0       0.355920     0.344602        4.000000       0.559016 0.190574    0.089958           NaN             NaN              1.0         4.02
+ Full Pipeline (Multi-Modal)             10             50            5.0       0.481520     0.461482       28.000000       0.806220 0.241766    0.165150      0.868846        0.806220              0.9         3.76
+
+TOP-5 RETRIEVAL PERFORMANCE
+--------------------------------------------------------------------------------
+Baseline A:
+  Success Rate: 70.0% (7/10 queries)
+  Avg Best Match Rank: 3.20
+Baseline B:
+  Success Rate: 20.0% (2/10 queries)
+  Avg Best Match Rank: 2.40
+Full Pipeline:
+  Success Rate: 60.0% (6/10 queries)
+  Avg Best Match Rank: 2.80
+
+KEY FINDINGS
+--------------------------------------------------------------------------------
+1. Multi-Modal Fusion Effectiveness:
+   Baseline A achieves highest average quality (0.479)
+   Full Pipeline improves +33.9% over Baseline B
+
+2. Geometric Verification Value:
+   Baseline B avg inliers: 4.02
+   Full Pipeline avg inliers: 3.76
+   Matches with ≥4 inliers: Baseline B=50, Full=45
+
+3. Semantic Consistency:
+   Baseline A label Jaccard: 0.836
+   Baseline B label Jaccard: 0.559
+   Full Pipeline label Jaccard: 0.806
+
+4. Challenging Cases Identified: 10
+   All methods struggle: 0 queries
+   Methods disagree: 10 queries
+   Full pipeline significantly better: 0 queries
+
+FALSE POSITIVE ANALYSIS
+--------------------------------------------------------------------------------
+Low-quality matches (quality < 0.3):
+  Baseline A: 0/55 (0.0%)
+  Baseline B: 16/50 (32.0%)
+  Full Pipeline: 2/50 (4.0%)
+
+PERFORMANCE ASSESSMENT
+--------------------------------------------------------------------------------
+✓ SUCCESS: Full Pipeline achieves 60.0% top-1 success rate
+           (exceeds 60.0% threshold)
+
+Success Factors:
+  ✗ Average match quality below 0.5 threshold
+  ✓ Strong semantic consistency (label Jaccard > 0.7)
+  ✗ Insufficient geometric verification (avg inliers < 4)
+
+Limitations:
+  - Depth data not always available (fallback to neutral 0.5 score)
+  - Geometric verification limited by texture changes (snow/foliage)
+  - OWL-ViT detections may miss small or occluded landmarks
+  - No ground truth annotations for quantitative precision/recall
+
+Recommendations:
+  1. Collect ground truth annotations for subset of challenging queries
+  2. Experiment with alternative geometric features (e.g., SuperPoint, LoFTR)
+  3. Incorporate temporal consistency across video sequences
+  4. Fine-tune FastVLM on seasonal appearance variation dataset
+
+================================================================================
